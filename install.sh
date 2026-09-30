@@ -129,15 +129,21 @@ version_at_least() {
 }
 
 install_composer_phar() {
-  local work dest expected actual
+  local version="$1"
+  local work dest url reported
   work="$(mktemp -d)"
   TMP_DIRS+=("$work")
-  curl -fsSL -o "${work}/composer-setup.php" https://getcomposer.org/installer
-  # The signature is published separately from the installer. getcomposer.org/installer.sig returns 404.
-  expected="$(curl -fsSL https://composer.github.io/installer.sig)"
-  actual="$(php -r "echo hash_file('sha384', \$argv[1]);" "${work}/composer-setup.php")"
-  if [[ "$expected" != "$actual" ]]; then
-    echo "Composer installer checksum did not match." >&2
+  # getcomposer.org/installer.sig returns 404, so install the versioned phar directly.
+  url="https://getcomposer.org/download/${version}/composer.phar"
+  echo "Downloading ${url}"
+  if ! curl -fL --retry 3 -sS -o "${work}/composer.phar" "$url"; then
+    echo "Could not download ${url}" >&2
+    exit 1
+  fi
+  reported="$(php "${work}/composer.phar" --version --no-ansi 2>/dev/null || true)"
+  reported="$(printf '%s\n' "$reported" | sed -n 's/^Composer version \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+  if [[ "$reported" != "$version" ]]; then
+    echo "Downloaded Composer reports ${reported:-nothing}, expected ${version}." >&2
     exit 1
   fi
   if [[ -w /usr/local/bin ]] || [[ "$(id -u)" -eq 0 ]]; then
@@ -149,9 +155,11 @@ install_composer_phar() {
     mkdir -p "$dest"
   fi
   if [[ -w "$dest" ]] || [[ "$(id -u)" -eq 0 ]]; then
-    php "${work}/composer-setup.php" --install-dir="$dest" --filename=composer
+    cp "${work}/composer.phar" "${dest}/composer"
+    chmod 755 "${dest}/composer"
   else
-    run_root php "${work}/composer-setup.php" --install-dir="$dest" --filename=composer
+    run_root cp "${work}/composer.phar" "${dest}/composer"
+    run_root chmod 755 "${dest}/composer"
   fi
   export PATH="${dest}:${PATH}"
   hash -r
@@ -171,7 +179,7 @@ ensure_composer() {
   else
     echo "Installing composer ${latest}..."
   fi
-  install_composer_phar
+  install_composer_phar "$latest"
   installed="$(composer_version || true)"
   if [[ -z "$installed" ]] || ! version_at_least "$installed" "$latest"; then
     echo "Composer ${latest} or newer is required. Found ${installed:-no composer on PATH}." >&2
