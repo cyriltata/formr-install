@@ -133,7 +133,8 @@ install_composer_phar() {
   work="$(mktemp -d)"
   TMP_DIRS+=("$work")
   curl -fsSL -o "${work}/composer-setup.php" https://getcomposer.org/installer
-  expected="$(curl -fsSL https://getcomposer.org/installer.sig)"
+  # The signature is published separately from the installer. getcomposer.org/installer.sig returns 404.
+  expected="$(curl -fsSL https://composer.github.io/installer.sig)"
   actual="$(php -r "echo hash_file('sha384', \$argv[1]);" "${work}/composer-setup.php")"
   if [[ "$expected" != "$actual" ]]; then
     echo "Composer installer checksum did not match." >&2
