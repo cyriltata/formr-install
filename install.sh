@@ -35,7 +35,8 @@ Usage: install-formr.sh [options]
 
 Download a formr release zip, install PHP and webpack assets, and copy
 config-dist into config when those files are not already there.
-The install directory must be missing or empty.
+If the install directory already exists, files from the release replace
+files at the same path. Files that are only in the install directory are kept.
 
 Options:
   --repo URL          Git repository (default: https://github.com/rubenarslan/formr.org)
@@ -43,7 +44,8 @@ Options:
   --ghcr-token TOKEN  Same as --token. Must be allowed to read repository contents
   --tag TAG           Release tag, for example v1.11.0 (default: latest release)
   --install-dir DIR   Install directory (default: /var/www/formr.org)
-  --env-file FILE     Env file whose keys fill existing config/settings.php values
+  --env-file FILE     Optional env file. Matching keys fill existing config/settings.php values.
+                      Omit it and edit config/settings.php after install.
   -h, --help          Show this help
 
 Existing files in the config directory are kept. --env-file updates
@@ -103,13 +105,30 @@ ensure_php() {
   exit 1
 }
 
-ensure_composer() {
-  if command -v composer >/dev/null 2>&1; then
-    echo "composer: $(command -v composer)"
-    return 0
-  fi
-  echo "Installing composer..."
-  ensure_php
+composer_version() {
+  local line
+  command -v composer >/dev/null 2>&1 || return 1
+  line="$(composer --version --no-ansi 2>/dev/null || true)"
+  printf '%s\n' "$line" | sed -n 's/^Composer version \([0-9][0-9.]*\).*/\1/p' | head -n 1
+}
+
+composer_latest_stable() {
+  curl -fsSL https://getcomposer.org/versions | php -r '
+    $json = json_decode(stream_get_contents(STDIN), true);
+    $version = $json["stable"][0]["version"] ?? "";
+    if (!is_string($version) || preg_match("/^[0-9]+\.[0-9]+\.[0-9]+$/", $version) !== 1) {
+        fwrite(STDERR, "Could not read the latest stable Composer version.\n");
+        exit(1);
+    }
+    echo $version;
+  '
+}
+
+version_at_least() {
+  php -r 'exit(version_compare($argv[1], $argv[2], ">=") ? 0 : 1);' "$1" "$2"
+}
+
+install_composer_phar() {
   local work dest expected actual
   work="$(mktemp -d)"
   TMP_DIRS+=("$work")
@@ -122,17 +141,117 @@ ensure_composer() {
   fi
   if [[ -w /usr/local/bin ]] || [[ "$(id -u)" -eq 0 ]]; then
     dest="/usr/local/bin"
+  elif command -v sudo >/dev/null 2>&1; then
+    dest="/usr/local/bin"
   else
     dest="${HOME}/.local/bin"
     mkdir -p "$dest"
-    export PATH="${dest}:${PATH}"
   fi
-  php "${work}/composer-setup.php" --install-dir="$dest" --filename=composer
+  if [[ -w "$dest" ]] || [[ "$(id -u)" -eq 0 ]]; then
+    php "${work}/composer-setup.php" --install-dir="$dest" --filename=composer
+  else
+    run_root php "${work}/composer-setup.php" --install-dir="$dest" --filename=composer
+  fi
+  export PATH="${dest}:${PATH}"
   hash -r
-  if ! command -v composer >/dev/null 2>&1; then
-    echo "composer was installed to ${dest} but is not on PATH." >&2
+}
+
+ensure_composer() {
+  local latest installed
+  ensure_php
+  latest="$(composer_latest_stable)"
+  installed="$(composer_version || true)"
+  if [[ -n "$installed" ]] && version_at_least "$installed" "$latest"; then
+    echo "composer: $(command -v composer) (${installed})"
+    return 0
+  fi
+  if [[ -n "$installed" ]]; then
+    echo "Updating composer ${installed} to ${latest}..."
+  else
+    echo "Installing composer ${latest}..."
+  fi
+  install_composer_phar
+  installed="$(composer_version || true)"
+  if [[ -z "$installed" ]] || ! version_at_least "$installed" "$latest"; then
+    echo "Composer ${latest} or newer is required. Found ${installed:-no composer on PATH}." >&2
     exit 1
   fi
+  echo "composer: $(command -v composer) (${installed})"
+}
+
+node_major_version() {
+  local raw
+  raw="$(node -v 2>/dev/null || true)"
+  raw="${raw#v}"
+  raw="${raw%%.*}"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    echo "$raw"
+  else
+    echo 0
+  fi
+}
+
+install_node_22() {
+  local arch work sums sum file name expected actual tarball
+  case "$(uname -m)" in
+    x86_64) arch="x64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *)
+      echo "Cannot install Node.js 22 for architecture $(uname -m)." >&2
+      exit 1
+      ;;
+  esac
+  work="$(mktemp -d)"
+  TMP_DIRS+=("$work")
+  sums="${work}/SHASUMS256.txt"
+  curl -fsSL -o "$sums" https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt
+  name=""
+  expected=""
+  while read -r sum file; do
+    if [[ "$file" == node-v22.*-linux-${arch}.tar.gz ]]; then
+      name="$file"
+      expected="$sum"
+      break
+    fi
+  done < "$sums"
+  if [[ -z "$name" || -z "$expected" ]]; then
+    echo "Could not find a Node.js 22 linux-${arch} archive." >&2
+    exit 1
+  fi
+  tarball="${work}/${name}"
+  echo "Downloading https://nodejs.org/dist/latest-v22.x/${name}"
+  curl -fsSL -o "$tarball" "https://nodejs.org/dist/latest-v22.x/${name}"
+  actual="$(php -r "echo hash_file('sha256', \$argv[1]);" "$tarball")"
+  if [[ "$expected" != "$actual" ]]; then
+    echo "Node.js archive checksum did not match." >&2
+    exit 1
+  fi
+  run_root tar -xzf "$tarball" -C /usr/local --strip-components=1
+  export PATH="/usr/local/bin:${PATH}"
+  hash -r
+}
+
+ensure_node() {
+  local major=0
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    major="$(node_major_version)"
+    if [[ "$major" -ge 22 ]]; then
+      echo "node: $(command -v node) ($(node -v))"
+      echo "npm: $(command -v npm) ($(npm -v))"
+      return 0
+    fi
+    echo "Node.js $(node -v) is older than 22. Installing Node.js 22..."
+  else
+    echo "Installing Node.js 22..."
+  fi
+  install_node_22
+  major="$(node_major_version)"
+  if [[ "$major" -lt 22 ]] || ! command -v npm >/dev/null 2>&1; then
+    echo "Node.js 22 or newer is required so npm can build the assets. Found node $(node -v 2>/dev/null || echo missing)." >&2
+    exit 1
+  fi
+  echo "node: $(command -v node) ($(node -v))"
+  echo "npm: $(command -v npm) ($(npm -v))"
 }
 
 parse_args() {
@@ -275,6 +394,8 @@ download_release() {
     exit 1
   fi
   mkdir -p "$INSTALL_DIR"
+  # Overlay the release onto the install directory. tar replaces files that
+  # exist in the archive and leaves every other file in place.
   tar -C "$src" --exclude='./config' --exclude='./formr-crypto.key' -cf - . | tar -C "$INSTALL_DIR" -xf -
 }
 
@@ -920,9 +1041,12 @@ main() {
     echo "Refusing to install into /." >&2
     exit 1
   fi
-  if [[ -d "$INSTALL_DIR" ]] && [[ -n "$(find "$INSTALL_DIR" -mindepth 1 -print -quit)" ]]; then
-    echo "Install directory ${INSTALL_DIR} already exists and is not empty." >&2
+  if [[ -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR" ]]; then
+    echo "Install path ${INSTALL_DIR} exists and is not a directory." >&2
     exit 1
+  fi
+  if [[ -d "$INSTALL_DIR" ]]; then
+    echo "Install directory ${INSTALL_DIR} already exists. Files from the release replace files at the same path. Files that are only in this directory are kept."
   fi
   if [[ -n "$TAG" && ! "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "Invalid tag: ${TAG}" >&2
@@ -941,7 +1065,7 @@ main() {
   ensure_php
   ensure_package_command curl curl
   ensure_composer
-  ensure_package_command npm npm
+  ensure_node
   ensure_package_command git git
   resolve_tag
   if [[ ! "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -994,6 +1118,8 @@ EOF
   fi
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# A downloaded pipe (`curl … | bash -s --`) leaves BASH_SOURCE empty.
+# Sourcing this file still skips main, because BASH_SOURCE is set and differs from $0.
+if [[ ${#BASH_SOURCE[@]} -eq 0 || "${BASH_SOURCE[0]:-}" == "$0" ]]; then
   main "$@"
 fi
